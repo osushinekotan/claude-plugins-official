@@ -26,6 +26,10 @@ import {
   ButtonStyle,
   ActionRowBuilder,
   type Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type User,
+  type PartialUser,
   type Attachment,
   type Interaction,
 } from 'discord.js'
@@ -81,12 +85,15 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const client = new Client({
   intents: [
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.DirectMessageReactions,
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
   ],
   // DMs arrive as partial channels — messageCreate never fires without this.
-  partials: [Partials.Channel],
+  // Reaction events on uncached messages arrive as partials — Message & Reaction needed.
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
 })
 
 type PendingEntry = {
@@ -829,6 +836,66 @@ client.on('messageCreate', msg => {
   if (msg.author.bot) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
+
+client.on('messageReactionAdd', (reaction, user) => {
+  handleReactionEvent(reaction, user, 'add').catch(e =>
+    process.stderr.write(`discord: handleReactionEvent failed: ${e}\n`))
+})
+
+client.on('messageReactionRemove', (reaction, user) => {
+  handleReactionEvent(reaction, user, 'remove').catch(e =>
+    process.stderr.write(`discord: handleReactionEvent failed: ${e}\n`))
+})
+
+async function handleReactionEvent(
+  reaction: MessageReaction | PartialMessageReaction,
+  user: User | PartialUser,
+  action: 'add' | 'remove',
+): Promise<void> {
+  if (user.bot) return
+
+  // Uncached messages/reactions arrive as partials — fetch full objects.
+  if (reaction.partial) reaction = await reaction.fetch()
+  if (user.partial) user = await user.fetch()
+
+  const msg = reaction.message.partial ? await reaction.message.fetch() : reaction.message
+  const chat_id = msg.channelId
+
+  // Access control — mirrors gate() logic but works with reaction event data.
+  const access = loadAccess()
+  const isDM = msg.channel.type === ChannelType.DM
+  if (isDM) {
+    if (!access.allowFrom.includes(user.id)) return
+  } else {
+    const channelId = msg.channel.isThread()
+      ? msg.channel.parentId ?? msg.channelId
+      : msg.channelId
+    const policy = access.groups[channelId]
+    if (!policy) return
+    const groupAllowFrom = policy.allowFrom ?? []
+    if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(user.id)) return
+  }
+
+  const emoji = reaction.emoji.name ?? reaction.emoji.id ?? 'unknown'
+
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: `[reaction ${action}] ${emoji}`,
+      meta: {
+        chat_id,
+        message_id: msg.id,
+        user: user.username,
+        user_id: user.id,
+        reaction_emoji: emoji,
+        reaction_action: action,
+        ts: new Date().toISOString(),
+      },
+    },
+  }).catch(err => {
+    process.stderr.write(`discord channel: failed to deliver reaction to Claude: ${err}\n`)
+  })
+}
 
 async function handleInbound(msg: Message): Promise<void> {
   const result = await gate(msg)
